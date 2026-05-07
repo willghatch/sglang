@@ -2515,6 +2515,21 @@ def gluon_extend_attention_fwd(
                     _avg_pfx >= 4096
                     and (batch_size >= 4 or _avg_pfx >= 16384)
                     and _total_tiles_est < _num_CUs
+                ) or (
+                    # Small-batch prefix-dominated medium-extend: WCA with
+                    # BM=128 beats DC with BM=64.  Requires prefix >= extend so
+                    # that prefix work dominates; when extend exceeds the
+                    # prefix, DC wins.
+                    batch_size <= 4
+                    and _avg_pfx >= 256
+                    and max_len_extend >= 256
+                    and max_len_extend <= _avg_pfx
+                ) or (
+                    # Medium-batch medium-prefix medium-extend:  WCA BM=128
+                    # beats DC BM=64 when prefix work dominates per tile.
+                    batch_size >= 8
+                    and _avg_pfx >= 2048
+                    and max_len_extend <= 512
                 )
             if _need_wca and _can_route_wca:
                 _launch_wca(

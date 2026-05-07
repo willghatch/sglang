@@ -96,9 +96,13 @@ def gluon_extend_attn_serial_fwd(
     SLIDING_WINDOW_SIZE: gl.constexpr = -1,
     HAS_WINDOW_OFFSETS: gl.constexpr = False,
     v_scale=1.0,
-    # XCD-aware PID remap metadata. The serial kernel is non-WCA and keeps
-    # these as identity defaults; 4w/8w data-centric and WCA wrappers may
-    # opt in through the dispatcher policy.
+    # WCA scheduling metadata (0 / False for data-centric launches).
+    IS_WCA: gl.constexpr = False,
+    num_heads=0,
+    total_valid_tiles=0,
+    total_programs=0,
+    actual_batch_size=0,
+    # XCD-aware PID remap metadata.
     XCD_REMAP: gl.constexpr = False,
     NUM_XCDS: gl.constexpr = 8,
     XCD_CHUNK: gl.constexpr = 1,
@@ -107,8 +111,8 @@ def gluon_extend_attn_serial_fwd(
     """Serial Gluon extend-attention kernel for gfx950 (NS=1, NW in {2, 4}).
 
     See ``ExtendAttnSerialProgram.run`` in ``_common.py`` for the body.
-    Always launched as a 3D data-centric grid (one tile per CTA); there is no
-    WCA variant.
+    Launched as a 3D data-centric grid (IS_WCA=False, default) or as a
+    compact 1D WCA grid (IS_WCA=True) for D<128 ragged-extend batches.
     """
     num_warps: gl.constexpr = gl.num_warps()
     BLOCK_DV: gl.constexpr = BLOCK_DMODEL
@@ -138,7 +142,7 @@ def gluon_extend_attn_serial_fwd(
         HAS_WINDOW_OFFSETS=HAS_WINDOW_OFFSETS,
         IS_FP8=IS_FP8,
         HAS_SINK=Sinks_present,
-        IS_WCA=False,
+        IS_WCA=IS_WCA,
         SPLIT_K=1,
         XCD_REMAP=XCD_REMAP,
         NUM_XCDS=NUM_XCDS,
@@ -182,13 +186,13 @@ def gluon_extend_attn_serial_fwd(
         sm_scale,
         kv_group_num,
         v_scale,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,  # WCA / split-K workspace (unused on the serial kernel)
+        num_heads,        # 0 for data-centric; head_num for WCA
+        total_valid_tiles,
+        total_programs,
+        0,  # partial_out  (no split-K for serial kernel)
+        0,  # partial_lse
+        0,  # tile_done
+        actual_batch_size,
     )
     pgm = ExtendAttnSerialProgram(state)
     pgm.run()
@@ -1576,6 +1580,8 @@ def _launch_attention_grid(
 
     if use_serial_kernel:
         serial_extra = {"IS_FP8": True} if kv_is_fp8 else {}
+        if is_wca:
+            serial_extra["IS_WCA"] = True
         gluon_extend_attn_serial_fwd[grid](
             q_extend,
             k_extend,
@@ -1615,6 +1621,10 @@ def _launch_attention_grid(
             SLIDING_WINDOW_SIZE=sliding_window_size,
             HAS_WINDOW_OFFSETS=has_window_offsets,
             v_scale=v_scale,
+            num_heads=head_num if is_wca else 0,
+            total_valid_tiles=total_valid_tiles if is_wca else 0,
+            total_programs=total_programs if is_wca else 0,
+            actual_batch_size=actual_batch_size if is_wca else 0,
             **serial_extra,
             num_warps=num_warps,
             num_stages=1,
@@ -1869,20 +1879,23 @@ def _launch_wca(
     forced_config=None,
     enable_prefix_unmasked=True,
 ):
-    """Launch WCA or split-K through the unified 4w/8w launch body.
+    """Launch WCA or split-K through the unified launch body.
 
     ``split_k == 1`` still selects ``IS_WCA=True``: the kernel gets a 1D
     compact tile space and the in-kernel strided tile walk. Only the
     split-K prefix partition, partial workspace, and final reduction are
     disabled.
+
+    D<128 BF16: the 4w sw-pipeline kernel requires D>=128, but the 8w pingpong
+    and the serial (NS=1, NW<=4) kernels both support D=64 BF16.  The 8w path
+    is used when the heuristic selects NW>=8; the serial IS_WCA path is used
+    when the heuristic selects NW<=4 (use_small_tile cases — see
+    ``_select_wca_heuristic_config``).  For serial IS_WCA the heuristic config
+    is clamped to NS=1 so ``_is_serial_schedule`` routes to the serial kernel.
     """
     q_shape = q_extend.shape
     Lq = q_shape[-1]
     block_dmodel = _resolve_qk_split_dims(Lq)
-    assert block_dmodel >= 128, (
-        f"_launch_wca: D<128 has no pipelined home; got {block_dmodel}. "
-        "Route D<128 through data-centric."
-    )
 
     batch_size = qo_indptr.shape[0] - 1
     head_num = q_shape[1]
@@ -1913,6 +1926,14 @@ def _launch_wca(
         split_k,
         _heuristic_config_cache_key(forced_config),
     )
+
+    # For D<128 BF16, the 4w sw-pipeline kernel requires D>=128 and cannot be
+    # used.  When the heuristic selects NW<=4 (use_small_tile path), force
+    # NS=1 so _is_serial_schedule routes to the serial IS_WCA kernel.
+    # NW>=8 configurations remain on the 8w pingpong kernel, which supports
+    # D=64 BF16 WCA without restriction.
+    if block_dmodel < 128 and not kv_is_fp8 and cfg.num_warps <= 4:
+        cfg = HeuristicConfig(cfg.block_m, cfg.block_n, cfg.num_warps, 1)
 
     grid_state = _finalize_wca_grid(
         q_extend=q_extend,
@@ -2400,13 +2421,56 @@ def gluon_extend_attention_fwd(
         and batch_size <= 8
     )
 
-    # WCA scope: only D=128 BF16/FP8 has a pipelined WCA home.
-    # D<128 kernels assert D>=128 (4w sw-pipe and FP8 8w pingpong), and
-    # D=256 WCA hits LDS pressure issues; both fall through to data-centric.
+    # WCA routing scope.  D=128 BF16/FP8 uses the full pipelined WCA path.
+    # D=64 BF16: 8w pingpong handles NW>=8 configs; serial IS_WCA handles
+    # NW<=4 configs (use_small_tile shapes, NS clamped to 1 in _launch_wca).
+    # D=256 WCA hits LDS pressure issues; falls through to data-centric.
     # D=128 B<=4 never satisfies the WCA clauses below, so skip.
     _skip_wca_check = (
         Lq == 128 and not _kv_is_fp8 and not _is_ragged_pfx and batch_size <= 4
     )
+
+    # D=64 BF16 ragged: route high-waste shapes to WCA to eliminate wasted CTAs.
+    # Threshold 0.6 avoids the moderate-waste regime where serial IS_WCA overhead
+    # may not offset the DC waste benefit.
+    if _is_ragged and Lq == 64 and not _kv_is_fp8 and not _skip_wca_check:
+        _total_ext = _total_extend_rows
+        _grid_est = batch_size * max_len_extend
+        _waste_frac_d64 = 1.0 - _total_ext / max(1, _grid_est)
+        _use_wca_d64 = (
+            _waste_frac_d64 >= 0.6 and batch_size >= 8
+        ) or (
+            _waste_frac_d64 >= 0.5 and max_len_extend >= 1024 and batch_size >= 5
+        )
+        if _use_wca_d64 and _can_route_wca:
+            _launch_wca(
+                q_extend,
+                k_extend,
+                v_extend,
+                o_extend,
+                k_buffer,
+                v_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                custom_mask,
+                is_causal,
+                mask_indptr,
+                max_len_extend,
+                k_scale,
+                v_scale,
+                sm_scale,
+                logit_cap,
+                sliding_window_size,
+                sinks,
+                window_kv_offsets,
+                xai_temperature_len,
+                _kv_is_fp8,
+                _total_pfx_est_pre,
+                min_len_extend,
+            )
+            return
+
     if _is_ragged and Lq == 128 and not _skip_wca_check:
         _total_ext = _total_extend_rows
         _grid_est = batch_size * max_len_extend

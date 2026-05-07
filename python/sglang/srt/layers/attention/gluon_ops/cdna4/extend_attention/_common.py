@@ -2927,9 +2927,16 @@ class ExtendAttnSerialProgram:
     def run(self):
         """Body of ``gluon_extend_attn_serial_fwd`` (NS=1, NW in {2, 4}).
 
-        Serial kernel: single CTA per (seq, head, m_tile),
-        synchronous smem, no async DMA, no masked-tail split. Always
-        launched as a 3D data-centric grid; there is no WCA variant.
+        Serial kernel: synchronous smem, no async DMA, no masked-tail split.
+        Launched as a 3D data-centric grid (IS_WCA=False) or as a compact 1D
+        WCA grid (IS_WCA=True) for D<128 ragged-extend batches that cannot use
+        the 4w sw-pipeline kernel.  The WCA path reuses ``_schedule_wca`` via
+        the composition delegation to ``self.state``.
+
+        Data-centric launches execute this loop body once: each CTA owns the
+        rectangular-grid tile encoded by program_id(0/1/2).  WCA launches a
+        compact 1D grid and reuses CTAs persistently; pid p handles
+        p, p + total_programs, p + 2*total_programs, ...
         """
         cfg: gl.constexpr = self.cfg
         tl.static_assert(cfg.NUM_STAGES == 1, "serial program requires NUM_STAGES=1")
@@ -2950,21 +2957,8 @@ class ExtendAttnSerialProgram:
 
         qk_scale = self.sm_scale * LOG2E
 
-        # Tile coords (data-centric only for serial).
-        (
-            cur_seq,
-            cur_head,
-            cur_block_m,
-            cur_kv_head,
-            cur_seq_q_start_idx,
-            seq_len_extend,
-            cur_seq_kv_start_idx,
-            seq_len_prefix,
-            is_valid_tile,
-            _,
-            _,
-        ) = self._schedule_data_centric()
-
+        # Tile-independent setup: smem banks and index ranges are allocated
+        # once per CTA and reused across the tile walk (WCA) or used once (DC).
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=cfg.layouts.offs_m_layout)
         offs_d = gl.arange(0, cfg.BLOCK_DMODEL, layout=cfg.layouts.offs_d_layout)
         offs_dv = gl.arange(0, cfg.BLOCK_DV, layout=cfg.layouts.offs_d_layout)
@@ -3014,182 +3008,221 @@ class ExtendAttnSerialProgram:
             layout=gl.SliceLayout(dim=0, parent=cfg.layouts.blocked_layout),
         )
 
-        mask_base_idx, mask_row_stride, mask_kv_col_offset = self._compute_mask_state(
-            cur_seq, seq_len_extend, seq_len_prefix
-        )
+        if cfg.IS_WCA:
+            tile_idx = gl.program_id(0)
+        else:
+            tile_idx = 0
 
-        q_dot, pfx_q = self._load_q(
-            cur_seq_q_start_idx,
-            cur_head,
-            cur_block_m,
-            seq_len_extend,
-            offs_m,
-            offs_d,
-        )
+        while tile_idx < (self.total_valid_tiles if cfg.IS_WCA else 1):
+            if cfg.IS_WCA:
+                (
+                    cur_seq,
+                    cur_head,
+                    cur_block_m,
+                    cur_kv_head,
+                    cur_seq_q_start_idx,
+                    seq_len_extend,
+                    cur_seq_kv_start_idx,
+                    seq_len_prefix,
+                    is_valid_tile,
+                    _,
+                    _,
+                ) = self._schedule_wca(tile_idx)
+            else:
+                (
+                    cur_seq,
+                    cur_head,
+                    cur_block_m,
+                    cur_kv_head,
+                    cur_seq_q_start_idx,
+                    seq_len_extend,
+                    cur_seq_kv_start_idx,
+                    seq_len_prefix,
+                    is_valid_tile,
+                    _,
+                    _,
+                ) = self._schedule_data_centric()
 
-        m_i, l_i, acc = self._init_softmax()
-        q_abs_pos, xai_temperature_reg = self._compute_q_abs_pos_and_xai(
-            seq_len_prefix, cur_block_m
-        )
-
-        # Serial kernel uses the same SWA prefix-skip as pipelined kernels.
-        pfx_kv_start, pfx_seq_len, pfx_q_abs_pos = self._compute_swa_skip(
-            cur_seq_kv_start_idx,
-            seq_len_prefix,
-            cur_block_m,
-            q_abs_pos,
-        )
-
-        # Prefix loop: serial, synchronous gather.
-        kv_indices_base = self.kv_indices + pfx_kv_start
-        k_prefix_base = self.K_Buffer + cur_kv_head * self.stride_buf_kh
-        v_prefix_base = self.V_Buffer + cur_kv_head * self.stride_buf_vh
-        n_prefix_blocks = (pfx_seq_len + cfg.BLOCK_N - 1) // cfg.BLOCK_N
-        for block_n in tl.range(0, n_prefix_blocks):
-            start_n = block_n * cfg.BLOCK_N
-
-            n_idx_k = start_n + kt_offs_n
-            mask_n_k = n_idx_k < pfx_seq_len
-            kv_locs_k = cdna4_buffer_load(
-                kv_indices_base,
-                n_idx_k.to(tl.int32),
-                mask=mask_n_k,
-                other=0,
-            ).to(tl.int32)
-            kt_offsets = (
-                kt_offs_d[:, None] + kv_locs_k[None, :] * self.stride_buf_kbs
-            ).to(tl.int32)
-            kt_global = cdna4_buffer_load(
-                k_prefix_base,
-                kt_offsets,
-                mask=mask_n_k[None, :],
-                other=0.0,
-            )
-            kt_prefix_smem.store(kt_global)
-            kt_dot = kt_prefix_smem.load(cfg.layouts.pfx_kt_dot_layout)
-
-            qk = gl.zeros(
-                [cfg.BLOCK_M, cfg.BLOCK_N],
-                dtype=gl.float32,
-                layout=cfg.layouts.mma_layout,
-            )
-            qk = do_mma(pfx_q, kt_dot, qk)
-            acc, l_i, m_i, p = self.compute_softmax_prefix(
-                acc,
-                l_i,
-                m_i,
-                qk,
-                start_n,
-                pfx_seq_len,
-                qk_scale,
-                xai_temperature_reg,
-                pfx_q_abs_pos,
-                cfg.BLOCK_N,
-                ENABLE_PREFIX_UNMASKED=cfg.IS_CAUSAL,
+            mask_base_idx, mask_row_stride, mask_kv_col_offset = self._compute_mask_state(
+                cur_seq, seq_len_extend, seq_len_prefix
             )
 
-            n_idx_v = start_n + v_offs_n
-            mask_n_v = n_idx_v < pfx_seq_len
-            kv_locs_v = cdna4_buffer_load(
-                kv_indices_base,
-                n_idx_v.to(tl.int32),
-                mask=mask_n_v,
-                other=0,
-            ).to(tl.int32)
-            v_offsets = (
-                kv_locs_v[:, None] * self.stride_buf_vbs + v_offs_d[None, :]
-            ).to(tl.int32)
-            v_global = cdna4_buffer_load(
-                v_prefix_base,
-                v_offsets,
-                mask=mask_n_v[:, None],
-                other=0.0,
-            )
-            v_prefix_smem.store(v_global)
-            v_dot = v_prefix_smem.load(cfg.layouts.pfx_v_dot_layout)
-            p_cast = p.to(v_dot.dtype)
-            p_dot = gl.convert_layout(p_cast, cfg.layouts.pfx_p_dot_layout)
-            acc = do_mma(p_dot, v_dot, acc)
-
-        # Extend loop: serial, synchronous row-major.
-        cur_block_m_end = (
-            seq_len_extend
-            if not cfg.IS_CAUSAL
-            else tl.minimum(seq_len_extend, (cur_block_m + 1) * cfg.BLOCK_M)
-        )
-        k_extend_base = (
-            self.K_Extend
-            + cur_seq_q_start_idx * self.stride_kbs
-            + cur_kv_head * self.stride_kh
-        )
-        v_extend_base = (
-            self.V_Extend
-            + cur_seq_q_start_idx * self.stride_vbs
-            + cur_kv_head * self.stride_vh
-        )
-        n_extend_blocks = (cur_block_m_end + cfg.BLOCK_N - 1) // cfg.BLOCK_N
-        for block_n in tl.range(0, n_extend_blocks):
-            start_n = block_n * cfg.BLOCK_N
-
-            kt_idx = start_n + kt_offs_n[None, :]
-            kt_offsets = (kt_offs_d[:, None] + kt_idx * self.stride_kbs).to(tl.int32)
-            kt_global = cdna4_buffer_load(
-                k_extend_base,
-                kt_offsets,
-                mask=kt_idx < cur_block_m_end,
-                other=0.0,
-            )
-            kt_extend_smem.store(kt_global)
-            kt_dot = kt_extend_smem.load(cfg.layouts.kt_dot_layout)
-
-            qk = gl.zeros(
-                [cfg.BLOCK_M, cfg.BLOCK_N],
-                dtype=gl.float32,
-                layout=cfg.layouts.mma_layout,
-            )
-            qk = do_mma(q_dot, kt_dot, qk)
-            acc, l_i, m_i, p = self.compute_softmax_extend(
-                acc,
-                l_i,
-                m_i,
-                qk,
-                start_n,
+            q_dot, pfx_q = self._load_q(
+                cur_seq_q_start_idx,
+                cur_head,
                 cur_block_m,
                 seq_len_extend,
-                qk_scale,
-                xai_temperature_reg,
-                mask_base_idx,
-                mask_row_stride,
-                mask_kv_col_offset,
-                cfg.BLOCK_N,
-                MASK_STEPS=True,
+                offs_m,
+                offs_d,
             )
 
-            v_idx = start_n + v_offs_n[:, None]
-            v_offsets = (v_idx * self.stride_vbs + v_offs_d[None, :]).to(tl.int32)
-            v_global = cdna4_buffer_load(
-                v_extend_base,
-                v_offsets,
-                mask=v_idx < cur_block_m_end,
-                other=0.0,
+            m_i, l_i, acc = self._init_softmax()
+            q_abs_pos, xai_temperature_reg = self._compute_q_abs_pos_and_xai(
+                seq_len_prefix, cur_block_m
             )
-            v_extend_smem.store(v_global)
-            v_dot = v_extend_smem.load(cfg.layouts.v_dot_layout)
-            p_cast = p.to(v_dot.dtype)
-            p_dot = gl.convert_layout(p_cast, cfg.layouts.p_dot_layout)
-            acc = do_mma(p_dot, v_dot, acc)
 
-        l_i = self._apply_sinks(cur_head, l_i, m_i)
-        self._normalize_and_store(
-            cur_seq_q_start_idx,
-            cur_head,
-            cur_block_m,
-            seq_len_extend,
-            acc,
-            l_i,
-            offs_m,
-            offs_dv,
-        )
+            pfx_kv_start, pfx_seq_len, pfx_q_abs_pos = self._compute_swa_skip(
+                cur_seq_kv_start_idx,
+                seq_len_prefix,
+                cur_block_m,
+                q_abs_pos,
+            )
+
+            # Prefix loop: serial, synchronous gather.
+            kv_indices_base = self.kv_indices + pfx_kv_start
+            k_prefix_base = self.K_Buffer + cur_kv_head * self.stride_buf_kh
+            v_prefix_base = self.V_Buffer + cur_kv_head * self.stride_buf_vh
+            n_prefix_blocks = (pfx_seq_len + cfg.BLOCK_N - 1) // cfg.BLOCK_N
+            for block_n in tl.range(0, n_prefix_blocks):
+                start_n = block_n * cfg.BLOCK_N
+
+                n_idx_k = start_n + kt_offs_n
+                mask_n_k = n_idx_k < pfx_seq_len
+                kv_locs_k = cdna4_buffer_load(
+                    kv_indices_base,
+                    n_idx_k.to(tl.int32),
+                    mask=mask_n_k,
+                    other=0,
+                ).to(tl.int32)
+                kt_offsets = (
+                    kt_offs_d[:, None] + kv_locs_k[None, :] * self.stride_buf_kbs
+                ).to(tl.int32)
+                kt_global = cdna4_buffer_load(
+                    k_prefix_base,
+                    kt_offsets,
+                    mask=mask_n_k[None, :],
+                    other=0.0,
+                )
+                kt_prefix_smem.store(kt_global)
+                kt_dot = kt_prefix_smem.load(cfg.layouts.pfx_kt_dot_layout)
+
+                qk = gl.zeros(
+                    [cfg.BLOCK_M, cfg.BLOCK_N],
+                    dtype=gl.float32,
+                    layout=cfg.layouts.mma_layout,
+                )
+                qk = do_mma(pfx_q, kt_dot, qk)
+                acc, l_i, m_i, p = self.compute_softmax_prefix(
+                    acc,
+                    l_i,
+                    m_i,
+                    qk,
+                    start_n,
+                    pfx_seq_len,
+                    qk_scale,
+                    xai_temperature_reg,
+                    pfx_q_abs_pos,
+                    cfg.BLOCK_N,
+                    ENABLE_PREFIX_UNMASKED=cfg.IS_CAUSAL,
+                )
+
+                n_idx_v = start_n + v_offs_n
+                mask_n_v = n_idx_v < pfx_seq_len
+                kv_locs_v = cdna4_buffer_load(
+                    kv_indices_base,
+                    n_idx_v.to(tl.int32),
+                    mask=mask_n_v,
+                    other=0,
+                ).to(tl.int32)
+                v_offsets = (
+                    kv_locs_v[:, None] * self.stride_buf_vbs + v_offs_d[None, :]
+                ).to(tl.int32)
+                v_global = cdna4_buffer_load(
+                    v_prefix_base,
+                    v_offsets,
+                    mask=mask_n_v[:, None],
+                    other=0.0,
+                )
+                v_prefix_smem.store(v_global)
+                v_dot = v_prefix_smem.load(cfg.layouts.pfx_v_dot_layout)
+                p_cast = p.to(v_dot.dtype)
+                p_dot = gl.convert_layout(p_cast, cfg.layouts.pfx_p_dot_layout)
+                acc = do_mma(p_dot, v_dot, acc)
+
+            # Extend loop: serial, synchronous row-major.
+            cur_block_m_end = (
+                seq_len_extend
+                if not cfg.IS_CAUSAL
+                else tl.minimum(seq_len_extend, (cur_block_m + 1) * cfg.BLOCK_M)
+            )
+            k_extend_base = (
+                self.K_Extend
+                + cur_seq_q_start_idx * self.stride_kbs
+                + cur_kv_head * self.stride_kh
+            )
+            v_extend_base = (
+                self.V_Extend
+                + cur_seq_q_start_idx * self.stride_vbs
+                + cur_kv_head * self.stride_vh
+            )
+            n_extend_blocks = (cur_block_m_end + cfg.BLOCK_N - 1) // cfg.BLOCK_N
+            for block_n in tl.range(0, n_extend_blocks):
+                start_n = block_n * cfg.BLOCK_N
+
+                kt_idx = start_n + kt_offs_n[None, :]
+                kt_offsets = (kt_offs_d[:, None] + kt_idx * self.stride_kbs).to(tl.int32)
+                kt_global = cdna4_buffer_load(
+                    k_extend_base,
+                    kt_offsets,
+                    mask=kt_idx < cur_block_m_end,
+                    other=0.0,
+                )
+                kt_extend_smem.store(kt_global)
+                kt_dot = kt_extend_smem.load(cfg.layouts.kt_dot_layout)
+
+                qk = gl.zeros(
+                    [cfg.BLOCK_M, cfg.BLOCK_N],
+                    dtype=gl.float32,
+                    layout=cfg.layouts.mma_layout,
+                )
+                qk = do_mma(q_dot, kt_dot, qk)
+                acc, l_i, m_i, p = self.compute_softmax_extend(
+                    acc,
+                    l_i,
+                    m_i,
+                    qk,
+                    start_n,
+                    cur_block_m,
+                    seq_len_extend,
+                    qk_scale,
+                    xai_temperature_reg,
+                    mask_base_idx,
+                    mask_row_stride,
+                    mask_kv_col_offset,
+                    cfg.BLOCK_N,
+                    MASK_STEPS=True,
+                )
+
+                v_idx = start_n + v_offs_n[:, None]
+                v_offsets = (v_idx * self.stride_vbs + v_offs_d[None, :]).to(tl.int32)
+                v_global = cdna4_buffer_load(
+                    v_extend_base,
+                    v_offsets,
+                    mask=v_idx < cur_block_m_end,
+                    other=0.0,
+                )
+                v_extend_smem.store(v_global)
+                v_dot = v_extend_smem.load(cfg.layouts.v_dot_layout)
+                p_cast = p.to(v_dot.dtype)
+                p_dot = gl.convert_layout(p_cast, cfg.layouts.p_dot_layout)
+                acc = do_mma(p_dot, v_dot, acc)
+
+            l_i = self._apply_sinks(cur_head, l_i, m_i)
+            self._normalize_and_store(
+                cur_seq_q_start_idx,
+                cur_head,
+                cur_block_m,
+                seq_len_extend,
+                acc,
+                l_i,
+                offs_m,
+                offs_dv,
+            )
+
+            if cfg.IS_WCA:
+                tile_idx += self.total_programs
+            else:
+                tile_idx = 1
 
 
 @composition

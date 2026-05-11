@@ -33,11 +33,18 @@ data-centric kernel".
 """
 
 import functools
+import os
 from enum import IntEnum
 from typing import NamedTuple
 
 import torch
 import triton
+
+# Benchmark toggle: set SGLANG_GLUON_LEGACY_GRID=1 to force all extend-
+# attention launches through the rectangular data-centric grid
+# (batch * heads * ceil(max_ext / BLOCK_M)), bypassing the compact WCA grid.
+# This reinstates the "wasted CTA" behavior for before/after comparisons.
+_FORCE_LEGACY_GRID = os.environ.get("SGLANG_GLUON_LEGACY_GRID", "0") == "1"
 
 from ._common import (
     ExtendAttentionLayouts,
@@ -2381,7 +2388,7 @@ def gluon_extend_attention_fwd(
     # points are gated off for these shapes.
     _has_sw_sinks = sliding_window_size > 0 and sinks is not None
     _can_use_fastpath = custom_mask is None
-    _can_route_wca = _can_use_fastpath and not _has_sw_sinks
+    _can_route_wca = _can_use_fastpath and not _has_sw_sinks and not _FORCE_LEGACY_GRID
     _is_uniform = (
         batch_size <= 1 or min_len_extend == max_len_extend or _uniform_by_shape
     )
@@ -2785,6 +2792,7 @@ def gluon_extend_attention_fwd(
     # intentionally skip it and fall through to the data-centric path below.
     _use_splitk = (
         (Lq > 64) and (Lq <= 128) and (custom_mask is None) and not _has_sw_sinks
+        and not _FORCE_LEGACY_GRID
     )
 
     if _use_splitk:

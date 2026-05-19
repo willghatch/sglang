@@ -46,6 +46,12 @@ import triton
 # This reinstates the "wasted CTA" behavior for before/after comparisons.
 _FORCE_LEGACY_GRID = os.environ.get("SGLANG_GLUON_LEGACY_GRID", "0") == "1"
 
+# Minimum ratio of max_prefix_len / avg_prefix_len to consider prefix lengths
+# "ragged" (genuinely heterogeneous).  At 2x the longest prefix is at least
+# double the average, meaning some CTAs iterate over significantly more prefix
+# KV than others -- enough imbalance for WCA's compact grid to pay off.
+_RAGGED_PFX_RATIO_THRESHOLD = 2
+
 from ._common import (
     ExtendAttentionLayouts,
     ExtendAttnConfig,
@@ -2417,7 +2423,6 @@ def gluon_extend_attention_fwd(
     )
     # True ragged prefix: actual heterogeneity in prefix lengths such that
     # some CTAs finish their prefix iteration much earlier than others.
-    # Detected when the longest prefix is at least 4x the average.
     _max_pfx = int(max_prefix_len) if max_prefix_len is not None else 0
     _avg_pfx = _total_pfx_est_pre // max(1, batch_size)
     _is_ragged_pfx = (
@@ -2425,7 +2430,7 @@ def gluon_extend_attention_fwd(
         and batch_size >= 4
         and _max_pfx > 0
         and _avg_pfx > 0
-        and _max_pfx >= 4 * _avg_pfx
+        and _max_pfx >= _RAGGED_PFX_RATIO_THRESHOLD * _avg_pfx
     )
 
     _is_ragged = _is_ragged_ext or _is_pfx_dominated or _is_ragged_pfx

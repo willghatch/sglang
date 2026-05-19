@@ -2324,6 +2324,14 @@ if __name__ == "__main__":
         action="store_true",
         help="Keep requests in order without shuffling. By default, requests are shuffled randomly.",
     )
+    group.add_argument(
+        "--gsp-ragged-prefix",
+        action="store_true",
+        help="Use ragged (widely varying) system prompt lengths across groups. "
+        "Overrides --gsp-system-prompt-len to generate groups with prefix lengths "
+        "ranging from ~100 to the specified max, creating batches with heterogeneous "
+        "prefix lengths to stress the extend-attention kernel's ragged-prefix handling.",
+    )
     mooncake_group = parser.add_argument_group("mooncake dataset arguments")
     mooncake_group.add_argument(
         "--mooncake-slowdown-factor",

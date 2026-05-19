@@ -32,6 +32,7 @@ class GeneratedSharedPrefixDataset(BaseDataset):
     send_routing_key: bool
     num_turns: int
     ordered: bool
+    ragged_prefix: bool = False
 
     @classmethod
     def from_args(cls, args: Namespace) -> "GeneratedSharedPrefixDataset":
@@ -48,6 +49,7 @@ class GeneratedSharedPrefixDataset(BaseDataset):
             send_routing_key=getattr(args, "gsp_send_routing_key", False),
             num_turns=getattr(args, "gsp_num_turns", 1),
             ordered=getattr(args, "gsp_ordered", False),
+            ragged_prefix=getattr(args, "gsp_ragged_prefix", False),
         )
 
     def load(
@@ -66,6 +68,7 @@ class GeneratedSharedPrefixDataset(BaseDataset):
             num_turns=self.num_turns,
             fast_prepare=self.fast_prepare,
             ordered=self.ordered,
+            ragged_prefix=self.ragged_prefix,
         )
 
 
@@ -102,6 +105,7 @@ def sample_generated_shared_prefix_requests(
     num_turns: int = 1,
     fast_prepare: bool = False,
     ordered: bool = False,
+    ragged_prefix: bool = False,
 ) -> List[DatasetRow]:
     """Generate benchmark requests with shared system prompts using random tokens and caching."""
     cache_path = get_gen_prefix_cache_path(
@@ -113,7 +117,7 @@ def sample_generated_shared_prefix_requests(
         output_len,
         tokenizer,
     )
-    should_cache = (range_ratio == 1) and not send_routing_key and num_turns == 1
+    should_cache = (range_ratio == 1) and not send_routing_key and num_turns == 1 and not ragged_prefix
 
     # Try to load from cache first
     if cache_path.exists() and should_cache:
@@ -123,17 +127,25 @@ def sample_generated_shared_prefix_requests(
 
     print(
         f"\nGenerating new input data... "
-        f"({num_groups=}, {prompts_per_group}, {system_prompt_len=}, {question_len=}, {output_len=}, {range_ratio=}, {num_turns=})"
+        f"({num_groups=}, {prompts_per_group}, {system_prompt_len=}, {question_len=}, {output_len=}, {range_ratio=}, {num_turns=}, {ragged_prefix=})"
     )
 
     run_random_str = uuid.uuid4().hex[:8]
     run_start_timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
 
-    system_prompt_lens = compute_random_lens(
-        full_len=system_prompt_len,
-        range_ratio=range_ratio,
-        num=num_groups,
-    )
+    if ragged_prefix:
+        # Generate system prompt lengths that span a wide range (100 to system_prompt_len)
+        # to create batches with heterogeneous prefix lengths
+        rng = np.random.default_rng(seed)
+        min_len = max(100, system_prompt_len // 80)
+        system_prompt_lens = np.geomspace(min_len, system_prompt_len, num=num_groups).astype(int).tolist()
+        rng.shuffle(system_prompt_lens)
+    else:
+        system_prompt_lens = compute_random_lens(
+            full_len=system_prompt_len,
+            range_ratio=range_ratio,
+            num=num_groups,
+        )
     question_lens = np.array(
         compute_random_lens(
             full_len=question_len,

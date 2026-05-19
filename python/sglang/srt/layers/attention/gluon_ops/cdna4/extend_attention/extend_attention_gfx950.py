@@ -2277,6 +2277,7 @@ def gluon_extend_attention_fwd(
     min_len_extend=None,
     total_prefix_len=None,
     total_extend_len=None,
+    max_prefix_len=None,
 ):
     _q_shape = q_extend.shape
     Lq = _q_shape[-1]
@@ -2396,7 +2397,7 @@ def gluon_extend_attention_fwd(
     # Small-ext + big-prefix-skew (e.g. spec-decode): looks uniform but
     # the longest-prefix CTA dominates, so WCA reclaims these.
     _prefix_bucket_fastpath = _pfx_bucket(_total_pfx_est_pre, batch_size)
-    _is_ragged_pfx = (
+    _is_pfx_dominated = (
         _can_route_wca
         and batch_size >= 4
         and max_len_extend <= 128
@@ -2414,7 +2415,20 @@ def gluon_extend_attention_fwd(
             and _total_pfx_est_pre >= batch_size * 8192
         )
     )
-    _is_ragged = _is_ragged_ext or _is_ragged_pfx
+    # True ragged prefix: actual heterogeneity in prefix lengths such that
+    # some CTAs finish their prefix iteration much earlier than others.
+    # Detected when the longest prefix is at least 4x the average.
+    _max_pfx = int(max_prefix_len) if max_prefix_len is not None else 0
+    _avg_pfx = _total_pfx_est_pre // max(1, batch_size)
+    _is_ragged_pfx = (
+        _can_route_wca
+        and batch_size >= 4
+        and _max_pfx > 0
+        and _avg_pfx > 0
+        and _max_pfx >= 4 * _avg_pfx
+    )
+
+    _is_ragged = _is_ragged_ext or _is_pfx_dominated or _is_ragged_pfx
 
     if _kv_is_fp8 and not _is_uniform and max_len_extend <= 64:
         _is_ragged = False
@@ -2434,7 +2448,9 @@ def gluon_extend_attention_fwd(
     # D=256 WCA hits LDS pressure issues; falls through to data-centric.
     # D=128 B<=4 never satisfies the WCA clauses below, so skip.
     _skip_wca_check = (
-        Lq == 128 and not _kv_is_fp8 and not _is_ragged_pfx and batch_size <= 4
+        Lq == 128 and not _kv_is_fp8
+        and not _is_pfx_dominated and not _is_ragged_pfx
+        and batch_size <= 4
     )
 
     # D=64 BF16 ragged: route high-waste shapes to WCA to eliminate wasted CTAs.
@@ -2447,7 +2463,7 @@ def gluon_extend_attention_fwd(
         _grid_est = batch_size * max_len_extend
         _waste_frac_d64 = 1.0 - _total_ext / max(1, _grid_est)
         _use_wca_d64 = (
-            _is_ragged_pfx
+            _is_pfx_dominated or _is_ragged_pfx
         ) or (
             _waste_frac_d64 >= 0.6 and batch_size >= 8
         ) or (
@@ -2489,10 +2505,11 @@ def gluon_extend_attention_fwd(
         _total_pfx_est = _total_pfx_est_pre
         if _kv_is_fp8:
             # FP8 WCA stays limited to prefix-driven shapes.
-            _use_wca = _is_ragged_pfx
+            _use_wca = _is_pfx_dominated or _is_ragged_pfx
         else:
             _use_wca = (
-                _is_ragged_pfx
+                _is_pfx_dominated
+                or _is_ragged_pfx
                 or (max_len_extend >= 1024 and _waste_frac > 0.05 and batch_size >= 5)
                 or (batch_size >= 8 and _total_pfx_est >= batch_size * 1024)
                 or (batch_size >= 8 and max_len_extend >= 768 and _waste_frac >= 0.4)
@@ -2605,6 +2622,11 @@ def gluon_extend_attention_fwd(
                     batch_size >= 8
                     and _avg_pfx >= 2048
                     and max_len_extend <= 512
+                ) or (
+                    # True ragged prefix: some sequences have much longer
+                    # prefix than others, causing CTA workload imbalance in
+                    # the DC grid.
+                    _is_ragged_pfx
                 )
             if _need_wca and _can_route_wca:
                 _launch_wca(

@@ -156,6 +156,7 @@ def mk_hetero(
         min_len_extend=min(ext_lens),
         total_prefix_len=total_pfx,
         total_extend_len=total_ext,
+        max_prefix_len=max(pfx_lens) if pfx_lens and max(pfx_lens) > 0 else None,
     )
 
 
@@ -174,6 +175,7 @@ def call_gluon_auto(t):
         min_len_extend=t["min_len_extend"],
         total_prefix_len=t["total_prefix_len"],
         total_extend_len=t["total_extend_len"],
+        max_prefix_len=t.get("max_prefix_len"),
     )
 
 

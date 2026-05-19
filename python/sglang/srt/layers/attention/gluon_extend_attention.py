@@ -26,6 +26,7 @@ def get_extend_attention_hints(forward_batch) -> dict[str, Optional[int]]:
             "total_prefix_len": None,
             "total_extend_len": None,
             "min_len_extend": None,
+            "max_prefix_len": None,
         }
 
     if isinstance(prefix_lens, torch.Tensor):
@@ -37,6 +38,7 @@ def get_extend_attention_hints(forward_batch) -> dict[str, Optional[int]]:
         "total_prefix_len": int(sum(prefix_lens)) if prefix_lens else 0,
         "total_extend_len": int(sum(extend_lens)) if extend_lens else 0,
         "min_len_extend": int(min(extend_lens)) if extend_lens else None,
+        "max_prefix_len": int(max(prefix_lens)) if prefix_lens else None,
     }
 
 

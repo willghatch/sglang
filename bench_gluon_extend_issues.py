@@ -424,9 +424,12 @@ def run_issue2():
     print("\n" + "=" * 80)
     print("ISSUE 2: WCA vs split-K vs data-centric heuristic")
     print("=" * 80)
+    print("  'best' = fastest forced path; 'auto routed' = which path auto chose")
+    print("  'penalty' = how much slower auto is vs best (blank if <2%)")
+    print()
     hdr = (
         f"{'case':<32s}  {'auto':>7s}  {'DC':>7s}  "
-        f"{'splitK':>7s}  {'WCA':>7s}  {'winner':>8s}  {'auto=?':>8s}"
+        f"{'splitK':>7s}  {'WCA':>7s}  {'best':>6s}  {'auto routed':>12s}  {'penalty':>7s}"
     )
     print(hdr)
     print("-" * len(hdr))
@@ -478,16 +481,16 @@ def run_issue2():
         if t_wca != float("inf"):
             forced.append(("WCA", t_wca))
 
-        best_forced = min(forced, key=lambda x: x[1])
-        winner = best_forced[0]
-        auto_match = min(forced, key=lambda x: abs(x[1] - t_auto))[0]
-        correct = "OK" if auto_match == winner else f"!={winner}"
+        best_name, best_time = min(forced, key=lambda x: x[1])
+        auto_routed = min(forced, key=lambda x: abs(x[1] - t_auto))[0]
+        penalty_pct = (t_auto - best_time) / best_time * 100 if best_time > 0 else 0
+        penalty_str = f"{penalty_pct:>+5.1f}%" if penalty_pct >= 2.0 else ""
 
-        sk_str = f"{t_sk:>5.1f}us" if t_sk != float("inf") else "   N/A  "
-        wca_str = f"{t_wca:>5.1f}us" if t_wca != float("inf") else "   N/A  "
+        sk_str = f"{t_sk:>5.1f}us" if t_sk != float("inf") else "    --  "
+        wca_str = f"{t_wca:>5.1f}us" if t_wca != float("inf") else "    --  "
         print(
             f"{label:<32s}  {t_auto:>5.1f}us  {t_dc:>5.1f}us  "
-            f"{sk_str}  {wca_str}  {winner:>8s}  {correct:>8s}"
+            f"{sk_str}  {wca_str}  {best_name:>6s}  {auto_routed:>12s}  {penalty_str:>7s}"
         )
 
 

@@ -2440,11 +2440,15 @@ def gluon_extend_attention_fwd(
     # D=64 BF16 ragged: route high-waste shapes to WCA to eliminate wasted CTAs.
     # Threshold 0.6 avoids the moderate-waste regime where serial IS_WCA overhead
     # may not offset the DC waste benefit.
+    # Also route ragged-prefix shapes (small uniform extend, large varying prefix)
+    # where WCA reclaims prefix-partition work vs the data-centric grid.
     if _is_ragged and Lq == 64 and not _kv_is_fp8 and not _skip_wca_check:
         _total_ext = _total_extend_rows
         _grid_est = batch_size * max_len_extend
         _waste_frac_d64 = 1.0 - _total_ext / max(1, _grid_est)
         _use_wca_d64 = (
+            _is_ragged_pfx
+        ) or (
             _waste_frac_d64 >= 0.6 and batch_size >= 8
         ) or (
             _waste_frac_d64 >= 0.5 and max_len_extend >= 1024 and batch_size >= 5
